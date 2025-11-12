@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 
 	"github.com/gorilla/websocket"
+	uuid "github.com/satori/go.uuid"
 )
 
 type ClientManager struct {
@@ -24,6 +26,13 @@ type Message struct {
 	Sender    string `json:"sender,omitempty"`
 	Recipient string `json:"recipient,omitempty"`
 	Content   string `json:"content,omitempty"`
+}
+
+var manager = ClientManager{
+	clients:    make(map[*Client]bool),
+	broadcast:  make(chan []byte),
+	register:   make(chan *Client),
+	unregister: make(chan *Client),
 }
 
 func (manager *ClientManager) start() {
@@ -61,25 +70,59 @@ func (manager *ClientManager) send(message []byte, ignore *Client) {
 	}
 }
 
-//TIP <p>To run your code, right-click the code and select <b>Run</b>.</p> <p>Alternatively, click
-// the <icon src="AllIcons.Actions.Execute"/> icon in the gutter and select the <b>Run</b> menu item from here.</p>
+func (client *Client) read() {
+	defer func() {
+		manager.unregister <- client
+		client.socket.Close()
+	}()
+
+	for {
+		_, message, err := client.socket.ReadMessage()
+		if err != nil {
+			manager.unregister <- client
+			client.socket.Close()
+			break
+		}
+		jsonMessage, _ := json.Marshal(&Message{Sender: client.id, Content: string(message)})
+		manager.broadcast <- jsonMessage
+	}
+}
+
+func (client *Client) write() {
+	defer func() {
+		client.socket.Close()
+	}()
+
+	for {
+		select {
+		case message, ok := <-client.send:
+			if !ok {
+				client.socket.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+
+			client.socket.WriteMessage(websocket.TextMessage, message)
+		}
+	}
+}
 
 func main() {
-	//TIP <p>Press <shortcut actionId="ShowIntentionActions"/> when your caret is at the underlined text
-	// to see how GoLand suggests fixing the warning.</p><p>Alternatively, if available, click the lightbulb to view possible fixes.</p>
-	var manager = ClientManager{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-	}
+	fmt.Println("Starting application...")
+	go manager.start()
+	http.HandleFunc("/ws", wsPage)
+	http.ListenAndServe(":12345", nil)
+}
 
-	s := "gopher"
-	fmt.Printf("Hello and welcome, %s!\n", s)
-
-	for i := 1; i <= 5; i++ {
-		//TIP <p>To start your debugging session, right-click your code in the editor and select the Debug option.</p> <p>We have set one <icon src="AllIcons.Debugger.Db_set_breakpoint"/> breakpoint
-		// for you, but you can always add more by pressing <shortcut actionId="ToggleLineBreakpoint"/>.</p>
-		fmt.Println("i =", 100/i)
+func wsPage(res http.ResponseWriter, req *http.Request) {
+	conn, error := (&websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}).Upgrade(res, req, nil)
+	if error != nil {
+		http.NotFound(res, req)
+		return
 	}
+	client := &Client{id: uuid.NewV4().String(), socket: conn, send: make(chan []byte)}
+
+	manager.register <- client
+
+	go client.read()
+	go client.write()
 }
